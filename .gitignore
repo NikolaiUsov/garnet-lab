@@ -1,0 +1,5 @@
+/env
+.env
+/docs
+/faiss_index
+/other
