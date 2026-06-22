@@ -63,9 +63,6 @@ for sheet_name in xl.sheet_names:
     df = pd.read_excel(xl, sheet_name=sheet_name, header=0, dtype=str)
     # Удаляем полностью пустые строки
     df = df.dropna(how='all')
-    # Удаляем строки, где все колонки (кроме "Изображение") пусты
-    #cols_to_check = [c for c in df.columns if c != "Изображение"]
-    #df = df.dropna(subset=cols_to_check, how='all')
 
     for idx, row in df.iterrows():
         # Формируем текст

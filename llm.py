@@ -7,11 +7,8 @@ from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_classic.retrievers.document_compressors import DocumentCompressorPipeline, CrossEncoderReranker, EmbeddingsFilter
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 from langchain_classic.retrievers.document_compressors import EmbeddingsFilter
-# from langchain.agents import create_agent
-# from langfuse.callback import CallbackHandler
-# from langfuse.decorators import observe, langfuse_context
 from docx import Document
-import camelot
+import pdfplumber
 import pandas as pd
 import os
 import re
@@ -26,10 +23,10 @@ import argparse
 # ---------------------CONFIG---------------------
 BASE_DIR = Path(__file__).resolve().parent  
 faiss_index_path = str(BASE_DIR / "faiss_index")
-SELECTED_MODEL = "openai/gpt-oss-20b:free"               # openai/gpt-4o-mini   openrouter/free
+SELECTED_MODEL = "openai/gpt-4o-mini"               # openai/gpt-4o-mini   openrouter/free
 openai_api_base="https://openrouter.ai/api/v1"   
-temperature=0.5
-max_tokens=1024
+temperature=0
+max_tokens=4096
 
 # Инициализация модели эмбеддингов
 embeddings_model = HuggingFaceEmbeddings(
@@ -119,9 +116,12 @@ def extract_tables_from_docx(file_path):
 # Функция извлекает данные из таблицы в файле .pdf
 def extract_tables_from_pdf(file_path):
     table_list = []
-    tables = camelot.read_pdf(file_path, pages='all', flavor='lattice')
-    for table in tables:
-        table_list.append(table.df.values.tolist())
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            page_tables = page.extract_tables()
+            for table in page_tables:
+                if table:
+                    table_list.append(table)
     return table_list
 
 def get_tables_text(file_path: Path):
@@ -135,33 +135,69 @@ def get_tables_text(file_path: Path):
 
 # Извлекаем полезную инфомрацию
 def parse_procurement_document(file_path):
-    text = get_tables_text(file_path)
+    tables = get_tables_text(file_path)          
+    if not tables:                               
+        raise ValueError("В документе не найдено подходящих данных")
+    # Преобразуем все таблицы в одну строку
+    text_lines = []
+    for table in tables:
+        for row in table:
+            row_text = " ".join(cell.strip() for cell in row if cell and cell.strip())
+            if row_text:
+                text_lines.append(row_text)
+    text = "\n".join(text_lines)
+
     if not text.strip():
         raise ValueError("В документе не найдено подходящих данных")
 
-    # Промпт для извлечения позиций
+    # Промпт для извлечения позиций — все фигурные скобки экранированы двойными {{ }}
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """Ты — эксперт по закупочной документации. Проанализируй содержимое данных из документа и извлеки все позиции,
-        относящиеся к светотехническому оборудованию (светильники, лампы, прожекторы, светодиодные ленты и т.п.).
-        Для каждой позиции укажи:
-        - name: точное наименование
-        - quantity: количество (число или диапазон)
-        - specifications: технические характеристики (мощность, напряжение, цветовая температура, материал, степень защиты и т.д.)
+    ("system", """Ты — эксперт по закупочной документации в области светотехники. Твоя задача — извлечь все позиции, относящиеся к осветительному оборудованию (светильники, лампы, прожекторы, опоры, кронштейны и т.п.) из текста документа закупки.
 
-        Верни результат строго в формате JSON по схеме:
-        {{
-          "items": [
-            {{"name": "...", "quantity": "...", "specifications": "..."}},
-            ...
-          ]
-        }}
-        Если позиции не найдены, верни {{"items": []}}.
-        Не добавляй пояснений, только JSON."""),
-        ("human", "{text}")
-    ])
+**ВАЖНЫЕ ПРАВИЛА:**
+
+1. Для каждой найденной позиции заполни поля:
+   - `name` — точное наименование из документа (как в таблице или описании).
+   - `quantity` — количество:
+        * если указано число — верни число (int).
+        * если указан диапазон (например, "10-15") — верни строку с диапазоном.
+        * если не указано — `null`.
+   - `specifications_raw` — **все** технические характеристики, перечисленные в документе для данной позиции, одной строкой (без изменений, с сохранением единиц измерения).
+   - `specs` — структурированные ключевые параметры для сопоставления с каталогом. **Заполняй только те поля, которые явно указаны в документе.** Если параметр не указан или указан неоднозначно — ставь `null`.
+
+2. **Нормализация значений для `specs`:**
+   - `power_w` — мощность в ваттах (число). Извлеки из текста, например: "40 Вт", "40W", "мощность 40 Вт" → 40. Если указан диапазон (например, "35–40 Вт") — возьми  минимальное значение (35). 
+   - `cct_k` — цветовая температура в кельвинах (число). Извлеки из текста: "4000 K", "4000К", "4000K" → 4000. Если диапазон — бери минимальное (например, "3000-4000" → 3000).
+   - `luminous_flux_lm` — световой поток в люменах (число). Аналогично.
+   - `dimensions_mm` — габариты в миллиметрах, **строго в формате "ДxШxВ"** или "ДxШ" (для плоских светильников). Приводи к нижнему регистру, без пробелов и без "мм". Например: "600×600 мм" → "600x600", "1200*300*80" → "1200x300x80". Если в документе несколько вариантов размеров — выбери тот, который относится к данной позиции (обычно указан в той же строке). Если неясно — `null`.
+
+3. **Если в документе нет светотехнических позиций** — верни `{{"items": []}}`.
+
+4. **Выходной формат** — строго JSON по схеме:
+{{
+  "items": [
+    {{
+      "name": "Светильник потолочный LED 600x600",
+      "quantity": 12,
+      "specifications_raw": "Светильник светодиодный, 40 Вт, 4000 К, 3600 лм, размер 600x600 мм, IP20",
+      "specs": {{
+        "dimensions_mm": "600x600",
+        "power_w": 40,
+        "cct_k": 4000,
+        "luminous_flux_lm": 3600
+      }}
+    }}
+  ]
+}}
+
+**Важно:** Верни только JSON, без пояснений, без markdown. 
+Пример:
+{{"items": [{{"name": "Светильник LED", "quantity": 10, "specifications_raw": "40W 4000K", "specs": {{"power_w": 40, "cct_k": 4000, "luminous_flux_lm": null, "dimensions_mm": null}}}}]}}"""),
+    ("human", "{text}")
+])
 
     chain = prompt | llm
-    response = chain.invoke({"text": text}) 
+    response = chain.invoke({"text": text})
 
     # Парсим JSON из ответа
     content = response.content.strip()
@@ -182,7 +218,7 @@ def find_best_match(item: Dict[str, str], retriever, llm):
     Для каждой позиции из файла с запросом ищет наиболее подходящую запись в каталоге.
     Возвращает словарь с результатами.
     """
-    query = f"{item['name']} {item['specifications']}".strip()
+    query = f"{item['name']} {item['specs']}".strip()
     if not query:
         query = item['name']
 
@@ -202,23 +238,20 @@ def find_best_match(item: Dict[str, str], retriever, llm):
         candidates = []
         for i, doc in enumerate(docs):
             candidates.append(f"Кандидат {i+1}:\n{doc.page_content}")
+        candidates_text = "\n".join(candidates)
 
+        # Используем ChatPromptTemplate с переменными
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """Ты — эксперт по светотехнике. Сравни позицию из документа закупки с предложенными кандидатами из каталога.
-            Выбери тот, который наиболее точно соответствует по наименованию и характеристикам, если подходящей позиции нет в каталоге, то найди 
-            наиболее близкую и укажи на этот факт в столбце Комментарий.
-            Ответь только номером кандидата (например, "1").
-            Если ни один не подходит, ответь "0"."""),
-            ("human", f"""Позиция из закупки:
-Название: {item['name']}
-Характеристики: {item['specifications']}
-
-Кандидаты из каталога:
-{chr(10).join(candidates)}
-""")
+            ("system", "Ты — эксперт по светотехнике. Сравни позицию из документа закупки с предложенными кандидатами из каталога. Выбери тот, который наиболее точно соответствует по наименованию и характеристикам, если подходящей позиции нет в каталоге, то найди наиболее близкую и укажи на этот факт в столбце Комментарий. Ответь только номером кандидата (например, '1'). Если ни один не подходит, ответь '0'."),
+            ("human", "Позиция из закупки:\nНазвание: {name}\nХарактеристики: {specs}\n\nКандидаты из каталога:\n{candidates}")
         ])
         chain = prompt | llm
-        response = chain.invoke({})
+        # передаём значения явно
+        response = chain.invoke({
+            "name": item['name'],
+            "specs": str(item.get('specs', {})),   # преобразуем словарь в строку
+            "candidates": candidates_text
+        })
         choice_text = response.content.strip()
         try:
             choice = int(choice_text)
@@ -248,3 +281,91 @@ def find_best_match(item: Dict[str, str], retriever, llm):
         "catalog_specs": catalog_specs,
         "comment": "Найдено соответствие"
     }
+
+
+# ---------- Основная функция ----------
+def process_procurement_file(file_path: Path) -> pd.DataFrame:
+    print(f"📄 Обработка файла: {file_path}")
+    items = parse_procurement_document(file_path)
+    if not items:
+        print("⚠️ Позиции не найдены.")
+        return pd.DataFrame()
+
+    print(f"🔍 Найдено {len(items)} позиций. Ищем соответствия в каталоге...")
+    results = []
+    for idx, item in enumerate(items, 1):
+        print(f"  Обработка позиции {idx}: {item['name']}")
+        match = find_best_match(item, retriever, llm)
+        results.append({
+            "Название позиции": item['name'],
+            "Требуемое кол-во": item['quantity'],
+            "Характеристики": item.get("specs") or item.get("specifications_raw", ""),
+            "Найденное сопоставление в каталоге (наименование)": match.get("catalog_name"),
+            "Найденное сопоставление в каталоге (характеристики)": match.get("catalog_specs"),
+            "Комментарий": match.get("comment", "")
+        })
+
+    return pd.DataFrame(results)
+
+
+def pick_file_via_dialog() -> Path | None:
+    """Открывает системный диалог выбора файла."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    selected = filedialog.askopenfilename(
+        title="Выберите файл закупки",
+        filetypes=[
+            ("Документы Word/PDF", "*.docx *.doc *.pdf"),
+            ("Word", "*.docx *.doc"),
+            ("PDF", "*.pdf"),
+            ("Все файлы", "*.*"),
+        ],
+    )
+    root.destroy()
+    return Path(selected) if selected else None
+
+
+# ... (предыдущий код остаётся без изменений) ...
+
+if __name__ == "__main__":
+    import argparse
+
+    # Создаём папку для результатов, если её нет
+    results_dir = BASE_DIR / "results"
+    results_dir.mkdir(exist_ok=True)
+
+    parser = argparse.ArgumentParser(description="Обработка файла закупки и поиск соответствий в каталоге.")
+    parser.add_argument("-f", "--file", type=str, help="Путь к файлу закупки (.docx или .pdf)")
+    args = parser.parse_args()
+
+    if args.file:
+        file_path = Path(args.file)
+        if not file_path.exists():
+            print(f"❌ Файл не найден: {file_path}")
+            sys.exit(1)
+    else:
+        print("🖱️ Выберите файл закупки в диалоговом окне...")
+        file_path = pick_file_via_dialog()
+        if file_path is None:
+            print("❌ Файл не выбран.")
+            sys.exit(0)
+
+    df = process_procurement_file(file_path)
+    if df.empty:
+        print("⚠️ Нет данных для сохранения.")
+        sys.exit(0)
+
+    # Формируем имена файлов
+    base_name = file_path.stem
+    csv_path = results_dir / f"{base_name}_result.csv"
+    xlsx_path = results_dir / f"{base_name}_result.xlsx"
+
+    # Сохраняем
+    df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+    df.to_excel(xlsx_path, index=False)
+
+    print(f"✅ Результаты сохранены:\n  📄 CSV:  {csv_path}\n  📊 XLSX: {xlsx_path}")
