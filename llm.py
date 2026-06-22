@@ -5,8 +5,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_classic.retrievers import ContextualCompressionRetriever
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_classic.retrievers.document_compressors import DocumentCompressorPipeline, CrossEncoderReranker, EmbeddingsFilter
-from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
-from langchain_classic.retrievers.document_compressors import EmbeddingsFilter
 from docx import Document
 import pdfplumber
 import pandas as pd
@@ -14,7 +12,7 @@ import os
 import re
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import List, Dict, Any
+from typing import Dict
 import json
 import sys
 import argparse
@@ -270,7 +268,7 @@ def find_best_match(item: Dict[str, str], retriever, llm):
             "comment": "Ни один кандидат не подходит"
         }
 
-    # Извлекаем из документа каталога наименование и характеристики (упрощённо)
+    # Извлекаем из документа каталога наименование и характеристики
     content = best_doc.page_content
     catalog_name = content.split('.')[0] if '.' in content else content[:50]
     catalog_specs = content
@@ -361,11 +359,9 @@ if __name__ == "__main__":
 
     # Формируем имена файлов
     base_name = file_path.stem
-    csv_path = results_dir / f"{base_name}_result.csv"
     xlsx_path = results_dir / f"{base_name}_result.xlsx"
 
     # Сохраняем
-    df.to_csv(csv_path, index=False, encoding='utf-8-sig')
     df.to_excel(xlsx_path, index=False)
 
-    print(f"✅ Результаты сохранены:\n  📄 CSV:  {csv_path}\n  📊 XLSX: {xlsx_path}")
+    print(f"✅ Результаты сохранены: 📊 XLSX: {xlsx_path}")
